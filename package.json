@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "esbuild ./index.js --bundle --outfile=./build/extensions/stremio-seeds/stremio-seeds.js --loader:.js=js --platform=node",
+    "build": "esbuild ./index.js --bundle --outfile=./build/extensions/stremio-seeds/stremio-seeds.js --loader:.js=js --platform=node --external:fs --external:os --external:path",
+    "build:copy-config": "node -e \"require('fs').copyFileSync('stremio-seeds.config','build/extensions/stremio-seeds/stremio-seeds.config')\"",
+    "build:all": "npm run build && npm run build:copy-config",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
@@ -19,6 +21,7 @@
     "parse-torrent": "^9.1.5"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "webpack-cli": "^5.1.4"
   }
 }

@@ -11,32 +11,99 @@ dotenv.configDotenv({
 
 const CURRENT_OS = os.platform();
 
-const LINUX_DEFAULT_CACHE_DIR = path.join(os.homedir(), '/.stremio-server/stremio-cache');
-const WINDOWS_DEFAULT_CACHE_DIR = path.join(os.homedir(), '/AppData/Roaming/stremio/stremio-server/stremio-cache');
-const MACOS_DEFAULT_CACHE_DIR = path.join(os.homedir(), '/Application Support/stremio-server/stremio-cache');
-const CUSTOM_CACHE_DIR = process.env.CACHE_DIR;
+const LINUX_DEFAULT_CACHE_DIR = path.join(os.homedir(), '.stremio-server', 'stremio-cache');
+const LINUX_ALT_CACHE_DIRS = [
+    path.join(os.homedir(), '.stremio', 'stremio-server', 'stremio-cache'),
+    path.join(os.homedir(), 'stremio-cache'),
+];
+const WINDOWS_DEFAULT_CACHE_DIR = path.join(os.homedir(), 'AppData', 'Roaming', 'stremio', 'stremio-server', 'stremio-cache');
+const MACOS_DEFAULT_CACHE_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'stremio-server', 'stremio-cache');
+const RAW_CUSTOM_CACHE_DIR = (process.env.CACHE_DIR || '').trim().replace(/^["']|["']$/g, '');
 
-let CacheDir;
-if(CURRENT_OS === 'win32')
-    CacheDir = WINDOWS_DEFAULT_CACHE_DIR;
-if(CURRENT_OS === 'linux')
-    CacheDir = LINUX_DEFAULT_CACHE_DIR;
-if(CURRENT_OS === 'darwin')
-    CacheDir = MACOS_DEFAULT_CACHE_DIR;
-if(CUSTOM_CACHE_DIR)
-    CacheDir = CUSTOM_CACHE_DIR;
+function readStremioCacheRootFromSettings() {
+    const candidates = [];
+    if (CURRENT_OS === 'win32') {
+        if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'stremio', 'stremio-server', 'server-settings.json'));
+        candidates.push(path.join(os.homedir(), 'AppData', 'Roaming', 'stremio', 'stremio-server', 'server-settings.json'));
+    } else if (CURRENT_OS === 'darwin') {
+        candidates.push(path.join(os.homedir(), 'Library', 'Application Support', 'stremio-server', 'server-settings.json'));
+    } else {
+        candidates.push(path.join(os.homedir(), '.stremio-server', 'server-settings.json'));
+        candidates.push(path.join(os.homedir(), '.stremio', 'stremio-server', 'server-settings.json'));
+    }
+    for (const file of candidates) {
+        try {
+            if (!fs.existsSync(file)) continue;
+            const json = JSON.parse(fs.readFileSync(file, 'utf-8'));
+            const cacheRoot = (json.cacheRoot || json.cache_root || '').toString().trim();
+            if (!cacheRoot) continue;
+            const cleaned = cacheRoot.replace(/^["']|["']$/g, '');
+            if (path.basename(cleaned) === 'stremio-cache') return cleaned;
+            return path.join(cleaned, 'stremio-cache');
+        } catch (err) {
+            console.error('Could not read server-settings.json at', file, '-', err.message);
+        }
+    }
+    return null;
+}
 
-CacheDir = CacheDir.replace(/\/$|\\$/, '');
+function resolveCacheDir() {
+    if (RAW_CUSTOM_CACHE_DIR) {
+        let dir = RAW_CUSTOM_CACHE_DIR.replace(/[/\\]+$/, '');
+        //Allow stremio-server folder
+        const base = (CURRENT_OS === 'win32' ? dir.split('\\') : dir.split('/')).pop() || '';
+        if (base.includes('stremio-server')) dir = path.join(dir, 'stremio-cache');
+        return dir;
+    }
+
+    const fromSettings = readStremioCacheRootFromSettings();
+    if (fromSettings) return fromSettings;
+
+    if (CURRENT_OS === 'win32') return WINDOWS_DEFAULT_CACHE_DIR;
+    if (CURRENT_OS === 'darwin') return MACOS_DEFAULT_CACHE_DIR;
+    // linux: prefer the one that already exists, else default
+    for (const alt of LINUX_ALT_CACHE_DIRS) {
+        try { if (fs.existsSync(alt)) return alt; } catch { /* ignore */ }
+    }
+    return LINUX_DEFAULT_CACHE_DIR;
+}
+
+let CacheDir = resolveCacheDir();
+CacheDir = CacheDir.replace(/[/\\]+$/, '');
 
 //Allow stremio-server folder
-if((CURRENT_OS === 'win32' ? CacheDir.split('\\') : CacheDir.split('/')).pop()?.includes('stremio-server'))
+if ((CURRENT_OS === 'win32' ? CacheDir.split('\\') : CacheDir.split('/')).pop()?.includes('stremio-server'))
     CacheDir = path.join(CacheDir, 'stremio-cache');
 
-//Hear about some guy can custom cache folder
-// if(CacheDir.split('/').pop() != 'stremio-cache' && fs.readdirSync(CacheDir)?.includes('stremio-cache'))
-//     CacheDir = path.join(CacheDir, 'stremio-cache');
+function ensureCacheDir(dir) {
+    try {
+        if (!dir) return false;
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        return fs.existsSync(dir);
+    } catch (err) {
+        console.error('Cannot create/access cache dir:', dir, '-', err.message);
+        return false;
+    }
+}
 
-if(!fs.existsSync(CacheDir)) fs.mkdirSync(CacheDir, {recursive: true});
+function safeListSubdirs(dir) {
+    if (!ensureCacheDir(dir)) return [];
+    try {
+        return fs.readdirSync(dir).filter(_dir => {
+            try {
+                return fs.statSync(path.join(dir, _dir)).isDirectory();
+            } catch {
+                return false;
+            }
+        });
+    } catch (err) {
+        // Never crash stremio-server: a missing/locked cache dir must not kill server.js
+        console.error('Cannot read cache dir (will retry next interval):', dir, '-', err.code || err.message);
+        return [];
+    }
+}
+
+ensureCacheDir(CacheDir);
 
 const CUSTOM_CACHE_SIZE = process.env.CUSTOM_CACHE_SIZE;
 let _CUSTOM_CACHE_SIZE;
@@ -49,18 +116,31 @@ if(CUSTOM_CACHE_SIZE) {
     size = parseInt(CUSTOM_CACHE_SIZE);
     _CUSTOM_CACHE_SIZE = size;
     if(size) {
-        const configFile = path.join(CacheDir, '..', 'server-settings.json');
-        if(fs.existsSync(configFile)) {
-            const _file = fs.readFileSync(configFile, 'utf-8');
-            const _json = JSON.parse(_file);
-            _json.cacheSize = size;
-            fs.writeFileSync(configFile, JSON.stringify(_json, null, 2));
-        }
-        else {
-            const settings = {
-                cacheSize: size
-            };
-            fs.writeFileSync(configFile, JSON.stringify(settings, null, 2));
+        try {
+            const configFile = path.join(CacheDir, '..', 'server-settings.json');
+            if(fs.existsSync(configFile)) {
+                try {
+                    const _file = fs.readFileSync(configFile, 'utf-8');
+                    const _json = JSON.parse(_file);
+                    _json.cacheSize = size;
+                    fs.writeFileSync(configFile, JSON.stringify(_json, null, 2));
+                } catch (err) {
+                    console.error('Could not update server-settings.json:', err.message);
+                }
+            }
+            else {
+                try {
+                    const settings = {
+                        cacheSize: size
+                    };
+                    ensureCacheDir(path.dirname(configFile));
+                    fs.writeFileSync(configFile, JSON.stringify(settings, null, 2));
+                } catch (err) {
+                    console.error('Could not write server-settings.json:', err.message);
+                }
+            }
+        } catch (err) {
+            console.error('CUSTOM_CACHE_SIZE handling failed (non-fatal):', err.message);
         }
     }
 
@@ -70,8 +150,9 @@ if(!process.env.QT_HOST)  process.env.QT_HOST = 'http://127.0.0.1';
 if(!process.env.QT_PORT)  process.env.QT_PORT = '6775';
 
 const BASE_URL = process.env.QT_HOST + ':' + process.env.QT_PORT;
-const USERNAME = process.env.USERNAME || 'admin';
-const PASSWORD = process.env.PASSWORD || '';
+// README uses QT_USERNAME/QT_PASSWORD, keep backward compat with USERNAME/PASSWORD
+const USERNAME = process.env.QT_USERNAME || process.env.USERNAME || 'admin';
+const PASSWORD = process.env.QT_PASSWORD ?? process.env.PASSWORD ?? '';
 let UPLOAD_LIMIT = process.env.UPLOAD_LIMIT; //bytes
 if(UPLOAD_LIMIT?.match(/kb/i)) UPLOAD_LIMIT = parseInt(UPLOAD_LIMIT) * 1024; else
 if(UPLOAD_LIMIT?.match(/mb/i)) UPLOAD_LIMIT = parseInt(UPLOAD_LIMIT) * 1024 * 1024; else
@@ -104,31 +185,38 @@ console.log('UPLOAD LIMIT:', UPLOAD_LIMIT);
 console.log('INCLUDE TRACKERS:', INCLUDE_TRACKER);
 console.log('############# END ##############');
 
-main();
+// Never let a startup failure kill Stremio's server.js (the ENOENT bug).
+main().catch(err => console.error('Stremio Seeds fatal (non-fatal for server):', err?.stack || err));
 
 async function main(){ 
     try {
         const login = await qbittorrent.login().catch(err => console.error(err));
         if(!login) {
-            console.error('Login Fail!');
+            console.error('Login Fail! Retrying in 10s...');
             return setTimeout(() => main(), 10000);
         }
 
-        cleanEmptyCache();
+        try { cleanEmptyCache(); } catch (err) { console.error('cleanEmptyCache failed (non-fatal):', err.message); }
         await Update();
         if(INTERVAL_CHECK) {
             setInterval(async () => {
-                await Update();
+                try { await Update(); } catch (err) { console.error('Periodic Update failed (non-fatal):', err.message); }
             }, INTERVAL_CHECK);
         }
     }
     catch(err) {
-        console.error(err);
+        console.error('main() failed (non-fatal, server keeps running):', err?.stack || err);
+        // Never let an uncaught throw kill server.js. Retry in 30s.
+        setTimeout(() => main(), 30000);
     }
 }
 
 async function Update() {
     try {
+        if(!ensureCacheDir(CacheDir)) {
+            console.error('Cache dir unavailable, skipping Update. Check CACHE_DIR / Stremio cacheRoot:', CacheDir);
+            return;
+        }
         if(KEEP_TORRENT_LOW_SEEDER && _CUSTOM_CACHE_SIZE) {
             const currentCacheSize = getFolderSize(CacheDir);
             if((currentCacheSize/_CUSTOM_CACHE_SIZE)*100 >= CLEAN_CACHE_PERCENT){
@@ -136,7 +224,7 @@ async function Update() {
             }
         }
 
-        let dirs = fs.readdirSync(CacheDir)?.filter(_dir => fs.statSync(path.join(CacheDir, _dir)).isDirectory());
+        let dirs = safeListSubdirs(CacheDir);
         //console.log(dirs.length);
         const torrentList = await qbittorrent.getTorrentList({
             category: 'Stremio Seeds'
@@ -150,36 +238,53 @@ async function Update() {
             console.log('Deleting Expired Torrents:', expiredTorrentsHash.length);
             await qbittorrent.removeTorrents(expiredTorrentsHash, true);
             for(const _dir of expiredTorrentsHash) {
-                fs.rmSync(path.join(CacheDir, _dir), {recursive: true});
+                try { fs.rmSync(path.join(CacheDir, _dir), {recursive: true, force: true}); }
+                catch (err) { console.error('Could not remove expired folder', _dir, '-', err.message); }
             }
         }
 
         const validDirs = dirs.filter(dir => !torrentListHashes.find(_hash => _hash === dir));
 
         for(const dir of validDirs) {
-            await addTorrent(path.join(CacheDir, dir));
+            try { await addTorrent(path.join(CacheDir, dir)); }
+            catch (err) { console.error('addTorrent failed for', dir, '-', err.message); }
         }
     }
     catch(err) {
-        console.error('Unknow Error!', err.stack);
+        // Critical: never re-throw. Stremio kills server.js on uncaught throw.
+        console.error('Update() failed (non-fatal, will retry next interval):', err?.stack || err);
+    }
+}
+
+function safeRmSync(target) {
+    try {
+        if (!target || !fs.existsSync(target)) return;
+        fs.rmSync(target, {recursive: true, force: true});
+    } catch (err) {
+        console.error('Could not remove', target, '-', err.message);
     }
 }
 
 function cleanEmptyCache() {
-    console.log('Cleaning empty folder...');
-    const dirs = fs.readdirSync(CacheDir)?.filter(_dir => fs.statSync(path.join(CacheDir, _dir)).isDirectory());
-    for(const dir of dirs) {
-        const folderPath = path.join(CacheDir, dir);
-        if(!checkFolder(folderPath)) {
-            console.log('Deleting folder:', folderPath);
-            fs.rmSync(folderPath, {recursive: true});
+    try {
+        console.log('Cleaning empty folder...');
+        const dirs = safeListSubdirs(CacheDir);
+        for(const dir of dirs) {
+            const folderPath = path.join(CacheDir, dir);
+            if(!checkFolder(folderPath)) {
+                console.log('Deleting folder:', folderPath);
+                safeRmSync(folderPath);
+            }
         }
+    } catch (err) {
+        console.error('cleanEmptyCache failed (non-fatal):', err.message);
     }
 }
 
 async function cleanTorrentsCache(currentSize) {
+  try {
     console.log('Cleaning torrent, bc cache is full...');
-    const dirs = fs.readdirSync(CacheDir)?.filter(_dir => fs.statSync(path.join(CacheDir, _dir)).isDirectory());
+    const dirs = safeListSubdirs(CacheDir);
     //console.log(dirs.length);
     const torrentList = await qbittorrent.getTorrentList({
         category: 'Stremio Seeds',
@@ -190,9 +295,13 @@ async function cleanTorrentsCache(currentSize) {
     const torrentListHashes = torrentList.map(_torrent => _torrent.hash);
 
     const _dirs = dirs.map(_dir => {
-        return {
-            name: _dir,
-            time: fs.statSync(path.join(CacheDir, _dir)).birthtimeMs
+        try {
+            return {
+                name: _dir,
+                time: fs.statSync(path.join(CacheDir, _dir)).birthtimeMs
+            }
+        } catch {
+            return { name: _dir, time: 0 };
         }
     })
     .sort((a,b) => b.time - a.time)
@@ -209,12 +318,18 @@ async function cleanTorrentsCache(currentSize) {
         if(!checkFolder(folderPath)) continue;
         const bitfield = path.join(folderPath, 'bitfield');
         const cacheTorrent = path.join(folderPath, 'cache');
-        const torrent = parseTorrent(fs.readFileSync(cacheTorrent));
+        let torrent;
+        try {
+            torrent = parseTorrent(fs.readFileSync(cacheTorrent));
+        } catch (err) {
+            console.error('Skipping corrupt cache torrent', _dir.name, '-', err.message);
+            continue;
+        }
         const totalPieces = (torrent.length - torrent.lastPieceLength)/torrent.pieceLength + 1;
         if(!checkBitField(bitfield, totalPieces)) {
             _removed_size += getFolderSize(folderPath);
             console.log('Cache Full: Deleting Folder:', _dir.name);
-            fs.rmSync(folderPath, {recursive: true});
+            safeRmSync(folderPath);
         }
         if(_removed_size >= _remove_size) break;
     }
@@ -227,90 +342,139 @@ async function cleanTorrentsCache(currentSize) {
             const folderPath = path.join(CacheDir, shouldDelete);
             _removed_size += getFolderSize(folderPath);
             console.log('Cache Full: Deleing Torrent + Folder:', shouldDelete);
-            await qbittorrent.removeTorrents([shouldDelete], true);
-            fs.rmSync(folderPath, {recursive: true});
+            try { await qbittorrent.removeTorrents([shouldDelete], true); } catch (err) { console.error('removeTorrents failed:', err.message); }
+            safeRmSync(folderPath);
         } else break;
     }
 
     console.log('Removed', Math.floor(_removed_size/(1024*1024)), 'MB');
+  } catch (err) {
+    console.error('cleanTorrentsCache failed (non-fatal):', err.message);
+  }
 }
 
 function getFolderSize(folderPath) {
     let totalSize = 0;
     const traverse = (currentPath) => {
-      const files = fs.readdirSync(currentPath);
+      let files;
+      try {
+        files = fs.readdirSync(currentPath);
+      } catch (err) {
+        // ENOENT (deleted by Stremio) or EACCES: count as 0, don't crash
+        return;
+      }
       files.forEach(file => {
-        const filePath = path.join(currentPath, file);
-        const stats = fs.lstatSync(filePath);
-        if (stats.isDirectory()) {
-          traverse(filePath);
-        }
-        else if(stats.isSymbolicLink()) {
-            try {
-                totalSize += stats.size;
-            }
-            catch(err) {
-                console.error('symbolink error:', filePath);
-            }
-        }
-        else {
-          totalSize += stats.size;
+        try {
+          const filePath = path.join(currentPath, file);
+          const stats = fs.lstatSync(filePath);
+          if (stats.isDirectory()) {
+            traverse(filePath);
+          }
+          else if(stats.isSymbolicLink()) {
+              try {
+                  totalSize += stats.size;
+              }
+              catch(err) {
+                  console.error('symbolink error:', filePath);
+              }
+          }
+          else {
+            totalSize += stats.size;
+          }
+        } catch {
+          // File vanished mid-scan (Stremio cleaning cache concurrently). Ignore.
         }
       });
     };
-    traverse(folderPath);
+    try {
+      if (!fs.existsSync(folderPath)) return 0;
+      traverse(folderPath);
+    } catch {
+      return totalSize;
+    }
     return totalSize;
 }
 
 function checkFolder(folderPath) {
-    const bitfield = path.join(folderPath, 'bitfield');
-    const cacheTorrent = path.join(folderPath, 'cache');
-    if(!fs.existsSync(bitfield) || !fs.existsSync(cacheTorrent)) return false;
-    return true;
+    try {
+        const bitfield = path.join(folderPath, 'bitfield');
+        const cacheTorrent = path.join(folderPath, 'cache');
+        if(!fs.existsSync(bitfield) || !fs.existsSync(cacheTorrent)) return false;
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 const createDirectories = (filePath) => {
-    const directory = path.dirname(filePath);
+    try {
+        const directory = path.dirname(filePath);
 
-    if (!fs.existsSync(directory)) {
-        createDirectories(directory);
-        fs.mkdirSync(directory);
+        if (!fs.existsSync(directory)) {
+            createDirectories(directory);
+            fs.mkdirSync(directory, { recursive: true });
+        }
+    } catch (err) {
+        console.error('createDirectories failed for', filePath, '-', err.message);
+        throw err;
     }
 };
 
 async function addTorrent(folderPath) {
-    const bitfield = path.join(folderPath, 'bitfield');
-    const cacheTorrent = path.join(folderPath, 'cache');
-    if(!fs.existsSync(bitfield) || !fs.existsSync(cacheTorrent)) return;
-    const torrent = parseTorrent(fs.readFileSync(cacheTorrent));
-    console.log(torrent.info.name.toString('utf-8'));
-
-    //Flatpak default folder
-    let _folderPath = folderPath;
-    if(process.env.FLATPAK_ID) _folderPath = folderPath.replace(os.homedir(), path.join(os.homedir(), '/.var/app/com.stremio.Stremio'));
-
-    let totalPieces = (torrent.length - torrent.lastPieceLength)/torrent.pieceLength + 1;
-    if(checkBitField(bitfield, totalPieces)) {
-        //make symbol link
-        for(const idx in torrent.files) {
-            const offset = path.join(_folderPath, idx);
-            const syml = path.join(folderPath, torrent.files[idx].path);
-            //console.log(fs.existsSync(syml), syml)
-            if(!fs.existsSync(syml) && fs.existsSync(offset)) {
-                createDirectories(syml);
-                fs.symlinkSync(offset, syml, 'file');
-            }
+    try {
+        const bitfield = path.join(folderPath, 'bitfield');
+        const cacheTorrent = path.join(folderPath, 'cache');
+        if(!fs.existsSync(bitfield) || !fs.existsSync(cacheTorrent)) return;
+        let torrent;
+        try {
+            torrent = parseTorrent(fs.readFileSync(cacheTorrent));
+        } catch (err) {
+            console.error('Skipping unreadable torrent cache at', folderPath, '-', err.message);
+            return;
         }
+        let torrentName = folderPath;
+        try { torrentName = torrent.info?.name?.toString('utf-8') || folderPath; } catch { /* ignore */ }
+        console.log(torrentName);
 
-        //add torrent to qbittorrent
-        console.log('Adding torrent at:', folderPath.split('/').pop());
-        await qbittorrent.addTorrentFile(cacheTorrent, _folderPath);
+        //Flatpak default folder
+        let _folderPath = folderPath;
+        if(process.env.FLATPAK_ID) _folderPath = folderPath.replace(os.homedir(), path.join(os.homedir(), '.var', 'app', 'com.stremio.Stremio'));
+
+        let totalPieces = (torrent.length - torrent.lastPieceLength)/torrent.pieceLength + 1;
+        if(checkBitField(bitfield, totalPieces)) {
+            //make symbol link
+            for(const idx in torrent.files) {
+                try {
+                    const offset = path.join(_folderPath, idx);
+                    const syml = path.join(folderPath, torrent.files[idx].path);
+                    //console.log(fs.existsSync(syml), syml)
+                    if(!fs.existsSync(syml) && fs.existsSync(offset)) {
+                        createDirectories(syml);
+                        try { fs.symlinkSync(offset, syml, 'file'); }
+                        catch (err) {
+                            // Windows needs admin/dev-mode for symlinks. Don't crash, just log once.
+                            console.error('symlink failed (run Stremio as admin on Windows?):', syml, '-', err.message);
+                        }
+                    }
+                } catch (err) {
+                    console.error('symlink entry failed (non-fatal):', err.message);
+                }
+            }
+
+            //add torrent to qbittorrent
+            console.log('Adding torrent at:', path.basename(folderPath));
+            try { await qbittorrent.addTorrentFile(cacheTorrent, _folderPath); }
+            catch (err) { console.error('addTorrentFile failed (non-fatal):', err.message); }
+        }
+    } catch (err) {
+        console.error('addTorrent failed (non-fatal) for', folderPath, '-', err.message);
     }
 }
 
 function checkBitField(bitFieldPath, totalPieces) {
-    let pieces = 0;
-    const bytes = fs.readFileSync(bitFieldPath);
+    try {
+        let pieces = 0;
+        const bytes = fs.readFileSync(bitFieldPath);
     for(const byte of bytes) {
         if(byte === 255)
             pieces += 8;
@@ -326,4 +490,8 @@ function checkBitField(bitFieldPath, totalPieces) {
     console.log('   => Pieces:', pieces, 'Percent:', Math.floor(percent * 100)/100 + '%');
     if(percent >= START_SEED_PERCENT) return true;
     return false;
+    } catch (err) {
+        console.error('checkBitField failed (non-fatal) for', bitFieldPath, '-', err.message);
+        return false;
+    }
 }
