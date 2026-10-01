@@ -5,6 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "standalone": "node index.js",
+    "patch": "node tools/patch/patch-server.js",
+    "patch:check": "node tools/patch/patch-server.js --check --no-copy",
     "build": "esbuild ./index.js --bundle --outfile=./build/extensions/stremio-seeds/stremio-seeds.js --loader:.js=js --platform=node --external:fs --external:os --external:path",
     "build:copy-config": "node -e \"require('fs').copyFileSync('stremio-seeds.config','build/extensions/stremio-seeds/stremio-seeds.config')\"",
     "build:all": "npm run build && npm run build:copy-config",
