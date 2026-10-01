@@ -3,6 +3,30 @@ const fs = require('fs');
 const FormData = require('form-data');
 const ParseTorrent = require('parse-torrent');
 
+const REQUEST_TIMEOUT_MS = parseInt(process.env.QT_TIMEOUT_MS, 10) || 15000;
+const REQUEST_RETRIES = parseInt(process.env.QT_RETRIES, 10) || 3;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Retry transient failures (ECONNREFUSED while qBit starts, 5xx, 429).
+// 4xx (e.g. 403 bad credentials) fails fast: retrying won't help.
+async function withRetry(fn, retries = REQUEST_RETRIES) {
+    let lastErr;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            lastErr = err;
+            const status = err?.response?.status;
+            if (status && status >= 400 && status < 500 && status !== 408 && status !== 429) throw err;
+            if (attempt < retries) await sleep(1000 * Math.pow(2, attempt - 1));
+        }
+    }
+    throw lastErr;
+}
+
 const DEFAULT_TRACKER = [
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://opentracker.i2p.rocks:6969/announce",
@@ -40,12 +64,13 @@ class qbittorrentAPI {
     }
 
     async login() {
-        return await axios.get(this.baseURl + '?' + this.auth,
+        return await withRetry(() => axios.get(this.baseURl + '?' + this.auth,
         {
+            timeout: REQUEST_TIMEOUT_MS,
             headers: {
                 Referer: this.baseURl
             }
-        }).then(res => {
+        })).then(res => {
             if(res.status == 200) {
                 this.cookie = res.headers.get('set-cookie')?.join(';');
                 if(this.cookie)
@@ -66,8 +91,9 @@ class qbittorrentAPI {
             'Cookie': this.cookie,
             ...options.headers
         }
+        options.timeout = options.timeout || REQUEST_TIMEOUT_MS;
 
-        return axios(this.baseURl + '/api/v2' + urlPath, options);
+        return withRetry(() => axios(this.baseURl + '/api/v2' + urlPath, options));
     }
 
     async getTorrentList(options = {

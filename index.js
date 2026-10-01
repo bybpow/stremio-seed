@@ -9,6 +9,13 @@ dotenv.configDotenv({
     path: path.join(__dirname, 'stremio-seeds.config')
 })
 
+// Timestamped logger: Stremio's server output has no dates, this makes
+// minipc troubleshooting possible without extra tooling.
+function ts() { try { return new Date().toISOString(); } catch { return ''; } }
+const log = (...a) => console.log(`[${ts()}]`, ...a);
+const logWarn = (...a) => console.warn(`[${ts()}] WARN:`, ...a);
+const logError = (...a) => console.error(`[${ts()}] ERROR:`, ...a);
+
 const CURRENT_OS = os.platform();
 
 const LINUX_DEFAULT_CACHE_DIR = path.join(os.homedir(), '.stremio-server', 'stremio-cache');
@@ -173,20 +180,36 @@ const INCLUDE_TRACKER = process.env.INCLUDE_STREMIO_TRACKER?.match(/true/i) ? tr
 const KEEP_TORRENT_LOW_SEEDER = process.env.KEEP_TORRENT_LOW_SEEDER?.match(/true/i) ? true : false;
 const CLEAN_CACHE_PERCENT = parseInt(process.env.CLEAN_CACHE_PERCENT) || 95;
 
+// Validate config early with actionable warnings (non-fatal).
+(function validateConfig() {
+    if (!/^https?:\/\//i.test(process.env.QT_HOST || '')) logWarn(`QT_HOST=${process.env.QT_HOST} should start with http:// or https://`);
+    const port = parseInt(process.env.QT_PORT, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) logWarn(`QT_PORT=${process.env.QT_PORT} is not a valid TCP port`);
+    if (typeof INTERVAL_CHECK === 'string') {
+        logWarn(`INTERVAL_CHECK=${process.env.INTERVAL_CHECK} not understood (use e.g. 30sec/5mins/1hour), periodic scan disabled`);
+        INTERVAL_CHECK = undefined;
+    }
+    if (process.env.UPLOAD_LIMIT && !Number.isFinite(UPLOAD_LIMIT)) logWarn(`UPLOAD_LIMIT=${process.env.UPLOAD_LIMIT} not understood, no upload limit applied`);
+    if (process.env.RATIO_LIMIT && !Number.isFinite(RATIO_LIMIT)) logWarn(`RATIO_LIMIT=${process.env.RATIO_LIMIT} not understood, no ratio limit applied`);
+    if (!RAW_CUSTOM_CACHE_DIR) log('CACHE_DIR empty, autodetecting from server-settings.json / OS defaults');
+    if (!process.env.QT_PASSWORD && !process.env.PASSWORD) logWarn('No QT_PASSWORD set, qBittorrent login may fail if WebUI needs auth');
+    if (CLEAN_CACHE_PERCENT < 1 || CLEAN_CACHE_PERCENT > 100) logWarn(`CLEAN_CACHE_PERCENT=${process.env.CLEAN_CACHE_PERCENT} out of 1-100, using 95`);
+})();
+
 const qbittorrent = new qt(BASE_URL, USERNAME, PASSWORD, { UPLOAD_LIMIT, RATIO_LIMIT, INCLUDE_TRACKER, BLOCK_DOWNLOAD, SKIP_CHECKING });
 
-console.log('############### Stremio Seeds ##############');
-console.log('OS:', CURRENT_OS);
-console.log('Cache Dir:', CacheDir);
-if(CUSTOM_CACHE_SIZE) console.log('Cache Size:', CUSTOM_CACHE_SIZE);
-console.log('INTERVAL CHECK:', INTERVAL_CHECK);
-console.log('RATIO LIMIT:', RATIO_LIMIT),
-console.log('UPLOAD LIMIT:', UPLOAD_LIMIT);
-console.log('INCLUDE TRACKERS:', INCLUDE_TRACKER);
-console.log('############# END ##############');
+log('############### Stremio Seeds ##############');
+log('OS:', CURRENT_OS);
+log('Cache Dir:', CacheDir);
+if(CUSTOM_CACHE_SIZE) log('Cache Size:', CUSTOM_CACHE_SIZE);
+log('INTERVAL CHECK:', INTERVAL_CHECK);
+log('RATIO LIMIT:', RATIO_LIMIT),
+log('UPLOAD LIMIT:', UPLOAD_LIMIT);
+log('INCLUDE TRACKERS:', INCLUDE_TRACKER);
+log('############# END ##############');
 
 // Never let a startup failure kill Stremio's server.js (the ENOENT bug).
-main().catch(err => console.error('Stremio Seeds fatal (non-fatal for server):', err?.stack || err));
+main().catch(err => logError('Stremio Seeds fatal (non-fatal for server):', err?.stack || err));
 
 async function main(){ 
     try {
